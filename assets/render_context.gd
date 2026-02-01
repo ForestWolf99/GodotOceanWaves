@@ -26,11 +26,19 @@ class Descriptor:
 
 	func _init(rid_ : RID, type_ : RenderingDevice.UniformType) -> void:
 		rid = rid_; type = type_
+	
+	## Returns a new descriptor that references the same resource but with a different uniform type
+	func as_sampler() -> Descriptor:
+		return Descriptor.new(rid, RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE)
+	
+	func as_image() -> Descriptor:
+		return Descriptor.new(rid, RenderingDevice.UNIFORM_TYPE_IMAGE)
 
 var device : RenderingDevice
 var deletion_queue := DeletionQueue.new()
 var shader_cache : Dictionary
 var needs_sync := false
+var default_sampler : RID
 
 static func create(device : RenderingDevice=null) -> RenderingContext:
 	var context := RenderingContext.new()
@@ -53,6 +61,17 @@ func compute_list_end() -> void: device.compute_list_end()
 func compute_list_add_barrier(compute_list : int) -> void: device.compute_list_add_barrier(compute_list)
 
 # --- HELPER FUNCTIONS ---
+func _create_default_sampler() -> RID:
+	if not default_sampler.is_valid():
+		var sampler_state := RDSamplerState.new()
+		sampler_state.min_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
+		sampler_state.mag_filter = RenderingDevice.SAMPLER_FILTER_LINEAR
+		sampler_state.repeat_u = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
+		sampler_state.repeat_v = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
+		sampler_state.repeat_w = RenderingDevice.SAMPLER_REPEAT_MODE_CLAMP_TO_EDGE
+		default_sampler = deletion_queue.push(device.sampler_create(sampler_state))
+	return default_sampler
+
 func load_shader(path : String) -> RID:
 	if not shader_cache.has(path):
 		var shader_file := load(path)
@@ -73,7 +92,7 @@ func create_uniform_buffer(size : int, data : PackedByteArray=[]) -> Descriptor:
 		data += padding
 	return Descriptor.new(deletion_queue.push(device.uniform_buffer_create(max(size, len(data)), data)), RenderingDevice.UNIFORM_TYPE_UNIFORM_BUFFER)
 
-func create_texture(dimensions : Vector2i, format : RenderingDevice.DataFormat, usage:=0x18B, num_layers:=0, view:=RDTextureView.new(), data : PackedByteArray=[]) -> Descriptor:
+func create_texture(dimensions : Vector2i, format : RenderingDevice.DataFormat, usage:=0x18B, num_layers:=0, view:=RDTextureView.new(), data : PackedByteArray=[], use_as_sampler:=false) -> Descriptor:
 	assert(num_layers >= 1)
 	var texture_format := RDTextureFormat.new()
 	texture_format.array_layers = 1 if num_layers == 0 else num_layers
@@ -82,16 +101,23 @@ func create_texture(dimensions : Vector2i, format : RenderingDevice.DataFormat, 
 	texture_format.height = dimensions.y
 	texture_format.texture_type = RenderingDevice.TEXTURE_TYPE_2D if num_layers == 0 else RenderingDevice.TEXTURE_TYPE_2D_ARRAY
 	texture_format.usage_bits = usage # Default: RenderingDevice.TEXTURE_USAGE_SAMPLING_BIT | RenderingDevice.TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | RenderingDevice.TEXTURE_USAGE_STORAGE_BIT | RenderingDevice.TEXTURE_USAGE_CAN_COPY_TO_BIT | RenderingDevice.TEXTURE_USAGE_CAN_COPY_FROM_BIT
-	return Descriptor.new(deletion_queue.push(device.texture_create(texture_format, view, data)), RenderingDevice.UNIFORM_TYPE_IMAGE)
+	var uniform_type = RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE if use_as_sampler else RenderingDevice.UNIFORM_TYPE_IMAGE
+	return Descriptor.new(deletion_queue.push(device.texture_create(texture_format, view, data)), uniform_type)
 
 ## Creates a descriptor set. The ordering of the provided descriptors matches the binding ordering
 ## within the shader.
-func create_descriptor_set(descriptors : Array[Descriptor], shader : RID, descriptor_set_index :=0) -> RID:
+func create_descriptor_set(descriptors : Array[Descriptor], shader : RID, descriptor_set_index :=0, sampler : RID=RID()) -> RID:
 	var uniforms : Array[RDUniform]
 	for i in range(len(descriptors)):
 		var uniform := RDUniform.new()
 		uniform.uniform_type = descriptors[i].type
 		uniform.binding = i  # This matches the binding in the shader.
+		if descriptors[i].type == RenderingDevice.UNIFORM_TYPE_SAMPLER_WITH_TEXTURE:
+			# For sampler+texture uniforms, we need to provide both a sampler and the texture
+			if not sampler.is_valid():
+				# Create a default sampler if none provided
+				sampler = _create_default_sampler()
+			uniform.add_id(sampler)
 		uniform.add_id(descriptors[i].rid)
 		uniforms.push_back(uniform)
 	return deletion_queue.push(device.uniform_set_create(uniforms, shader, descriptor_set_index))

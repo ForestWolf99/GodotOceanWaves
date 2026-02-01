@@ -15,7 +15,7 @@
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-layout(rgba16f, set = 0, binding = 0) restrict readonly uniform image2DArray spectrum;
+layout(set = 0, binding = 0) uniform sampler2DArray spectrum;
 
 layout(std430, set = 1, binding = 0) restrict writeonly buffer FFTBuffer {
 	vec2 data[]; // map_size x map_size x num_spectra x 2 * num_cascades
@@ -53,7 +53,7 @@ float dispersion_relation(in float k) {
 void main() {
 	const uint map_size = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
 	const uint num_stages = findMSB(map_size); // Equivalent: log2(map_size) (assuming map_size is a power of 2)
-	const ivec2 dims = imageSize(spectrum).xy;
+	const ivec2 dims = ivec2(textureSize(spectrum, 0).xy);
 	const ivec3 id = ivec3(gl_GlobalInvocationID.xy, cascade_index);
 
 	vec2 k_vec = (id.xy - dims*0.5)*2.0*PI / tile_length; // Wave direction
@@ -61,7 +61,7 @@ void main() {
 	vec2 k_unit = k_vec / k;
 
 	// --- WAVE SPECTRUM MODULATION ---
-	vec4 h0 = imageLoad(spectrum, id); // xy=h0(k), zw=conj(h0(-k))
+	vec4 h0 = texelFetch(spectrum, id, 0); // xy=h0(k), zw=conj(h0(-k))
 	float dispersion = dispersion_relation(k) * time;
 	vec2 modulation = exp_complex(dispersion);
 	// Note: h respects the complex conjugation property

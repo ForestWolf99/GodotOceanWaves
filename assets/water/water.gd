@@ -34,7 +34,6 @@ enum MeshQuality { LOW, HIGH, HIGH8K }
 		parameters = value
 		_setup_wave_generator()
 		_update_scales_uniform()
-		_setup_cpu_displacement_textures()
 
 @export_group('Performance Parameters')
 
@@ -81,7 +80,10 @@ func _ready() -> void:
 	RenderingServer.global_shader_parameter_set(&'water_color', water_color.srgb_to_linear())
 	RenderingServer.global_shader_parameter_set(&'foam_color', foam_color.srgb_to_linear())
 
-var update_textures:bool = true
+## Enable CPU-side displacement texture updates for collision detection.
+## Note: This causes frame stuttering due to GPU->CPU readback on the render thread.
+## Disable if you don't need CPU-side wave height queries.
+@export var enable_cpu_displacement_readback:bool = false
 
 var just_calculated_water:bool = false
 func _process(delta : float) -> void:
@@ -93,7 +95,7 @@ func _process(delta : float) -> void:
 		next_update_time = time + target_update_delta
 		_update_water(update_delta)
 		#_copy_cpu_displacement_textures_buffer()
-		if update_textures:
+		if enable_cpu_displacement_readback:
 			_manage_cpu_displacement_textures_updates(delta)
 		just_calculated_water = true
 	time += delta
@@ -115,6 +117,18 @@ func _setup_wave_generator() -> void:
 	RenderingServer.global_shader_parameter_set(&'num_cascades', parameters.size())
 	RenderingServer.global_shader_parameter_set(&'displacements', displacement_maps)
 	RenderingServer.global_shader_parameter_set(&'normals', normal_maps)
+	
+	# Initialize CPU displacement textures dict but don't try to read them yet (they're empty)
+	_actually_used_textures_idx = []
+	_cpu_displacement_textures.clear()
+	for i in range(len(parameters)):
+		var cascade = parameters[i]
+		if cascade.displacement_scale > 0.001:
+			_actually_used_textures_idx.append(i)
+			# Create placeholder images that will be populated after first wave update
+			_cpu_displacement_textures[i] = Image.create(wave_generator.map_size, wave_generator.map_size, false, Image.FORMAT_RGBAH)
+	if not mutex:
+		mutex = Mutex.new()
 
 func _update_scales_uniform() -> void:
 	var map_scales : PackedVector4Array; map_scales.resize(len(parameters))
@@ -159,16 +173,10 @@ func _manage_cpu_displacement_textures_updates(delta) -> void:
 		_texture_loading_index += 1
 		if _texture_loading_index >= len(_cpu_displacement_textures):
 			_texture_loading_index = 0
-		var _buffer_img : Image
-		thread = Thread.new()
 		_img_async_image_idx = _cpu_displacement_textures_indeces[_texture_loading_index]
-		thread.start(_update_cpu_displacement_textures)
-		#_update_cpu_displacement_textures()
-		if not _buffer_img:
-			thread.wait_to_finish()
-		mutex.lock()
+		# texture_get_data MUST be called from the render thread, so we call it directly instead of using a thread
+		_update_cpu_displacement_textures()
 		_cpu_displacement_textures[_img_async_image_idx] = _img_async_buffer
-		mutex.unlock()
 		_displacement_textures_update_time = 0.0
 	_displacement_textures_update_time += delta
 
@@ -183,34 +191,38 @@ func _manage_cpu_displacement_textures_updates(delta) -> void:
 # 	for cascade_index in _cpu_displacement_textures.keys():
 # 		_update_cpu_displacement_textures(cascade_index)
 
-func _setup_cpu_displacement_textures() -> void:
-	# load first_n_cascades_for_collision_detection textures
-	var _actually_used_textures_idx:Array = []
-	for i in range(len(parameters)):
-		var cascade = parameters[i]
-		if cascade.displacement_scale > 0.001:
-			_actually_used_textures_idx.append(i)
-	
-	var rid_displacement_map = wave_generator.descriptors[&'displacement_map'].rid
-	var device:RenderingDevice = RenderingServer.get_rendering_device()
-	for i in range(len(parameters)):
-		if i in _actually_used_textures_idx:
-			var tex = device.texture_get_data(rid_displacement_map, i) # layer is the texture of the cascade with the same index
-			var img:Image = Image.create_from_data(wave_generator.map_size, wave_generator.map_size, false, Image.FORMAT_RGBAH, tex)
-			#_cpu_displacement_textures_buffer[i] = img
-			_cpu_displacement_textures[i] = img
-	mutex = Mutex.new()
+# NOTE: This function is no longer needed as we initialize placeholder textures in _setup_wave_generator()
+# and populate them asynchronously through _update_cpu_displacement_textures()
+# func _setup_cpu_displacement_textures() -> void:
+# 	# load first_n_cascades_for_collision_detection textures
+# 	var _actually_used_textures_idx:Array = []
+# 	for i in range(len(parameters)):
+# 		var cascade = parameters[i]
+# 		if cascade.displacement_scale > 0.001:
+# 			_actually_used_textures_idx.append(i)
+# 	
+# 	var rid_displacement_map = wave_generator.descriptors[&'displacement_map'].rid
+# 	var device:RenderingDevice = RenderingServer.get_rendering_device()
+# 	for i in range(len(parameters)):
+# 		if i in _actually_used_textures_idx:
+# 			var tex = device.texture_get_data(rid_displacement_map, i) # layer is the texture of the cascade with the same index
+# 			var img:Image = Image.create_from_data(wave_generator.map_size, wave_generator.map_size, false, Image.FORMAT_RGBAH, tex)
+# 			#_cpu_displacement_textures_buffer[i] = img
+# 			_cpu_displacement_textures[i] = img
+# 	mutex = Mutex.new()
 
 var _img_async_buffer : Image
 var _img_async_image_idx:int = 0
 func _update_cpu_displacement_textures() -> void:
+	# Ensure wave_generator is initialized and has processed at least one frame
+	if not wave_generator or not wave_generator.descriptors.has(&'displacement_map'):
+		return
+	
 	var rid_displacement_map = wave_generator.descriptors[&'displacement_map'].rid
 	var device:RenderingDevice = RenderingServer.get_rendering_device()
 	var tex = device.texture_get_data(rid_displacement_map, _img_async_image_idx) # layer is the texture of the cascade with the same index
-	var img = Image.create_from_data(wave_generator.map_size, wave_generator.map_size, false, Image.FORMAT_RGBAH, tex)
-	mutex.lock()
-	_img_async_buffer = img
-	mutex.unlock()
+	if tex.size() > 0:  # Only create image if we got valid data
+		_img_async_buffer = Image.create_from_data(wave_generator.map_size, wave_generator.map_size, false, Image.FORMAT_RGBAH, tex)
 
 func _world_to_uv(W:Vector2, tile_length:Vector2) -> Vector2:
 	return Vector2(
